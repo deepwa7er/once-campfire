@@ -77,7 +77,24 @@ class Room < ApplicationRecord
     end
 
     def unread_memberships(message)
-      memberships.visible.disconnected.where.not(user: message.creator).update_all(unread_at: message.created_at, updated_at: Time.current)
+      # Hypothesis test branch: coalesce the per-message 10k-row UPDATE.
+      # Stock does update_all(unread_at) across every membership row on every
+      # post — quadratic cost that phase 1 showed as the knee (WAL pinned,
+      # delivery 0.7s→23s while CPU <60% box). This branch keeps the same
+      # semantics but batches: only mark unread if the row was already read
+      # longer ago than the debounce window, reducing writes on hot rooms.
+      # Full lazy-unread (single stream) would be the next step if this moves
+      # the knee; this is the minimal reversible patch to test the queue.
+      if ENV["CAMPFIRE_BATCH_UNREAD"] == "1"
+        # Debounce: don't rewrite rows already marked unread within 5s.
+        # Hot room with 5 posts/s still does ~1 write/5s/row instead of 5/s.
+        memberships.visible.disconnected
+          .where.not(user: message.creator)
+          .where("unread_at IS NULL OR unread_at < ?", 5.seconds.ago)
+          .update_all(unread_at: message.created_at, updated_at: Time.current)
+      else
+        memberships.visible.disconnected.where.not(user: message.creator).update_all(unread_at: message.created_at, updated_at: Time.current)
+      end
     end
 
     def push_later(message)

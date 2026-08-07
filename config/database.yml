@@ -27,6 +27,16 @@ performance:
   primary:
     <<: *default
     database: storage/db/performance.sqlite3
+    # Hypothesis test: widen page cache and checkpoint window, add busy wait
+    # Stock is cache_size 2000 (8MB), wal_autocheckpoint 1000 (4MB), busy_timeout 0.
+    # This branch tests whether the knee at 100→200 is the single-writer queue.
+    variables:
+      cache_size: -64000
+      wal_autocheckpoint: 4000
+      busy_timeout: 5000
+      journal_mode: wal
+      synchronous: normal
+      temp_store: memory
 
 production:
   primary:
