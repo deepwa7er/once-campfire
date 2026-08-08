@@ -1,45 +1,72 @@
-# Campfire hypothesis test — is SQLite the bottleneck?
+# Campfire performance branch — what is here and why
 
-Branch: `once-campfire-perf` (local fork at `~/code/once-campfire-perf`, copied from `basecamp/once-campfire` main).
+Branch: `variant/perf-pragma` on `deepwa7er/once-campfire`, measured by
+[campfire-stress](https://github.com/deepwa7er/campfire-stress) and read in
+[readout](https://github.com/deepwa7er/readout).
 
-## Hypothesis
-Phase 1 knee at 100→200 (fanout 0.7s→23s, post 1.3s→20s, CPU 467%→585% / 800% = 8 cores, WAL pinned 8.1MB) is queueing behind SQLite's single writer + Redis per-member broadcast, not hardware or Wi-Fi.
+Two changes remain, and both keep every feature working. A third was removed —
+see the last section, because it is the most useful thing on this page.
 
-## Changes in this branch (all behind flags, stock preserved when off)
+## 1. SQLite pragmas — `config/database.yml`, `performance` only
 
-**1. Cheap pragmas — `config/database.yml` `performance.variables`:**
-- `cache_size: -64000` (64MB vs stock 2000=8MB)
-- `wal_autocheckpoint: 4000` (vs 1000=4MB)
-- `busy_timeout: 5000` (vs 0)
-- `journal_mode: wal`, `synchronous: normal`, `temp_store: memory`
-Effect: larger page cache, fewer checkpoints, wait instead of SQLITE_BUSY. Tests H1 without code.
+| | stock | here |
+|---|---|---|
+| `cache_size` | 2000 pages (~8 MB) | **-64000 (64 MB)** |
+| `wal_autocheckpoint` | 1000 pages | **4000** |
+| `busy_timeout` | already 5 s via `timeout:` | 5000, stated explicitly |
+| `journal_mode` / `synchronous` / `temp_store` | wal / normal / default | wal / normal / **memory** |
 
-**2. Batched unread — `app/models/room.rb#unread_memberships`:**
-- When `CAMPFIRE_BATCH_UNREAD=1`, only `UPDATE` rows where `unread_at IS NULL OR unread_at < 5.seconds.ago`.
-- Hot room at 5 posts/s goes from 5 writes/s/row → ~1/5s/row. Minimal reversible patch; full lazy-unread (single stream) is next if this moves the knee.
-- Env off → stock `update_all` unchanged.
+The database is about 20 MB at 700 employees, so an 8 MB page cache cannot hold
+it and a 64 MB one can. That is the change worth measuring; the rest are either
+Rails' defaults restated or already covered by `timeout:`.
 
-**3. Coalesced broadcast — `app/models/message/broadcasts.rb#broadcast_unread_room`:**
-- When `CAMPFIRE_COALESCE_BROADCAST=1`, broadcast once to `unread_room:#{room.id}` instead of plucking 10k user_ids and broadcasting N times to `UnreadRoomsChannel`.
-- Off → stock per-user loop unchanged.
+**This block did nothing for its first three weeks.** It was keyed `variables:`,
+which is the MySQL and Postgres convention — the SQLite adapter reads `pragmas:`
+and ignores keys it does not recognise, so nothing failed and nothing applied.
+Every measurement labelled "tuned" before 2026-08-08 was taken against stock
+SQLite settings. If a result from that period is cited anywhere, it is a result
+about the application changes below and not about SQLite at all.
 
-## How to test on `laptop` (fedora-1)
+## 2. Batched unread — `app/models/room.rb`
 
-```sh
-# Build the forked image for the performance instance only
-ssh laptop 'bash -lc "cd ~/code/once-campfire-perf && docker build -t campfire:perf-pragma ."'
-# Or via once: once deploy campfire:perf-pragma --env performance --host 100.100.110.47
+Behind `CAMPFIRE_BATCH_UNREAD=1`. Stock rewrites every disconnected member's
+membership row on every post; this skips rows already marked unread within the
+last five seconds.
 
-# Baseline (flags off, stock behaviour, but with new image)
-ssh laptop 'bash -lc "CAMPFIRE_BATCH_UNREAD=0 CAMPFIRE_COALESCE_BROADCAST=0 docker run --rm -p 127.0.0.1:8103:80 -v once-app-once-campfire.ee2a3e:/storage campfire:perf-pragma"'
+**No feature changes.** `unread_at` is read as a boolean everywhere it is used
+(`unread?` is `unread_at.present?`, and the sidebar scope is
+`where.not(unread_at: nil)`), so a row that is already showing a badge does not
+need the newer timestamp. A membership that has been *read* has `unread_at` of
+NULL and is therefore always re-marked — the badge still lights.
 
-# Pragmas only (variables are already in DB config for performance env)
-# → run campfire-stress: PEOPLE=100,200 against hot 10k room
+What it saves is write volume, and with it time holding SQLite's single writer,
+which every other write in the app queues behind.
 
-# Batched + coalesced
-CAMPFIRE_BATCH_UNREAD=1 CAMPFIRE_COALESCE_BROADCAST=1 bin/run.sh scenarios/chat.js  # PEOPLE=100,200
-# Compare fanout p95, post p95, server.csv cpu_pct / wal_bytes / db_bytes
-# Expected: pragmas shave edge; batching+coalescing should flatten 100→200 if writer is ceiling.
+## 3. Coalesced broadcast — REMOVED, and worth understanding
+
+This branch used to publish one broadcast per room instead of one per member:
+
+```ruby
+ActionCable.server.broadcast "unread_room:#{room.id}", { roomId: room.id }
 ```
 
-Revert: redeploy stock `ghcr.io/basecamp/once-campfire:1.4.9` to `ee2a3e` volume — no data loss (same `/storage` layout). Production container `1c9ee2` untouched.
+It was the fastest change here by a distance — in a 700-employee company it took
+posting from a p95 of 1,211 ms to 158 ms and cut server CPU by a fifth.
+
+It also broke the unread badge. Clients subscribe through `UnreadRoomsChannel`,
+which streams from `user_<id>_unreads`; nothing subscribes to `unread_room:<id>`,
+so the notification went nowhere. A real user's sidebar would simply stop
+lighting up for rooms they were not looking at.
+
+The load test could not see that. It subscribes to `UnreadRoomsChannel` with an
+empty callback and asserts nothing arrives, so a server that stopped sending
+unread notifications measured as a server that had got faster. **A benchmark
+only measures the work you make it check for.**
+
+Two ways to have the win without removing the feature, neither yet measured:
+
+- **Pipeline the publishes.** 700 sequential Redis round trips inside the
+  poster's request become one batched write. Same semantics.
+- **Move them off the request.** `messages_controller#create` calls
+  `broadcast_create` directly, so the poster waits for the whole fan-out. A
+  background job does the same work without the poster paying for it.

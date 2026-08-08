@@ -27,10 +27,25 @@ performance:
   primary:
     <<: *default
     database: storage/db/performance.sqlite3
-    # Hypothesis test: widen page cache and checkpoint window, add busy wait
-    # Stock is cache_size 2000 (8MB), wal_autocheckpoint 1000 (4MB), busy_timeout 0.
-    # This branch tests whether the knee at 100→200 is the single-writer queue.
-    variables:
+    # Widen the page cache and the checkpoint window.
+    #
+    # The key is `pragmas`, and it took a while to be. This block said
+    # `variables` for its first three weeks, which is the MySQL and Postgres
+    # convention: the SQLite adapter reads `pragmas` and silently ignores keys
+    # it does not know, so nothing failed and nothing applied. Every "tuned"
+    # measurement taken in that time was of stock SQLite settings.
+    #
+    # Rails' own defaults are journal_mode: wal, synchronous: normal and
+    # cache_size 2000, so two of these only restate what was already true and
+    # the third was being actively reset to the default on every connection.
+    # They are written out anyway: this file is the record of what the
+    # experiment set, and a reader should not have to know the adapter's
+    # defaults to know what was asked for.
+    #
+    # busy_timeout is here for the same reason, and is also already covered:
+    # `timeout: 5000` in the default block above becomes a busy handler on
+    # every connection.
+    pragmas:
       cache_size: -64000
       wal_autocheckpoint: 4000
       busy_timeout: 5000
